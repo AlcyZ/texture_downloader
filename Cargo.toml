@@ -1,0 +1,14 @@
+[package]
+name= "texture_downloader"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+reqwest = { version = "0.13", features = ["stream", "rustls"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "signal"] }
+scraper = "0.25"
+url = "2.5"
+futures = "0.3"
+anyhow = "1"
+chrono = "0.4"
+
