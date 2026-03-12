@@ -10,37 +10,42 @@ use reqwest::Client;
 use scraper::{Html, Selector};
 use tokio::fs;
 
-use crate::app::{DownloadArgs, DownloadMode};
+use crate::app::{DownloadArgs, DownloadMode, SkyboxSize, TextureSize};
 
 const TEXTURE_URL: &str = "https://freestylized.com/all-textures/";
 const SKYBOX_URL: &str = "https://freestylized.com/all-skybox/";
 
 enum DownloadTarget {
-    Textures,
-    Skybox,
+    Textures(TextureSize),
+    Skybox(SkyboxSize),
+}
+
+impl DownloadTarget {
+    fn kind(&self) -> &str {
+        match self {
+            DownloadTarget::Textures(_) => "texture",
+            DownloadTarget::Skybox(_) => "skybox",
+        }
+    }
 }
 
 pub async fn run(args: DownloadArgs) -> Result<()> {
     args.ensure_download_directory_exists().await;
 
     let client = Client::builder().build().context("Build HTTP client")?;
-    let button_text_textures = "1K";
-    let button_text_skybox = "2K";
 
-    let download_tex = async || {
+    let download_tex = async |size| {
         download(
-            DownloadTarget::Textures,
-            button_text_textures,
+            DownloadTarget::Textures(size),
             &client,
             args.download_textures_dir(),
         )
         .await
     };
 
-    let download_sky = async || {
+    let download_sky = async |size| {
         download(
-            DownloadTarget::Skybox,
-            button_text_skybox,
+            DownloadTarget::Skybox(size),
             &client,
             args.download_skybox_dir(),
         )
@@ -48,38 +53,37 @@ pub async fn run(args: DownloadArgs) -> Result<()> {
     };
 
     match args.mode() {
-        DownloadMode::All => {
+        DownloadMode::All {
+            size_textures,
+            size_skybox,
+        } => {
             let mut tasks: FuturesUnordered<BoxFuture<Result<()>>> = FuturesUnordered::new();
 
-            tasks.push(Box::pin(download_tex()));
-            tasks.push(Box::pin(download_sky()));
+            tasks.push(Box::pin(download_tex(size_textures)));
+            tasks.push(Box::pin(download_sky(size_skybox)));
 
             while tasks.next().await.is_some() {}
         }
-        DownloadMode::Textures => download_tex().await?,
-        DownloadMode::Skybox => download_sky().await?,
+        DownloadMode::Textures { size_textures } => download_tex(size_textures).await?,
+        DownloadMode::Skybox { size_skybox } => download_sky(size_skybox).await?,
     }
 
     Ok(())
 }
 
-async fn download(
-    target: DownloadTarget,
-    button_text: &str,
-    client: &Client,
-    download_dir: PathBuf,
-) -> Result<()> {
-    let url = match target {
-        DownloadTarget::Textures => TEXTURE_URL,
-        DownloadTarget::Skybox => SKYBOX_URL,
+async fn download(target: DownloadTarget, client: &Client, download_dir: PathBuf) -> Result<()> {
+    let (url, button_text) = match target {
+        DownloadTarget::Textures(size) => (TEXTURE_URL, size.to_string()),
+        DownloadTarget::Skybox(size) => (SKYBOX_URL, size.to_string()),
     };
     let pages = fetch_download_pages(&client, url).await?;
-    log(format!("found {} pages", pages.len()));
+    log(format!("Found {} {} pages", pages.len(), target.kind()));
 
     let (downloads, misses) = fetch_download_links(&client, pages, button_text).await;
     log(format!(
-        "found {} downloads and {} invalid links",
+        "Found {} {} downloads and {} invalid links",
         downloads.len(),
+        target.kind(),
         misses.len()
     ));
 
@@ -94,15 +98,18 @@ async fn download_data(
     download_dir: PathBuf,
     target: DownloadTarget,
 ) {
-    let downloads_len = downloads.len();
-    let kind = match target {
-        DownloadTarget::Textures => "texture",
-        DownloadTarget::Skybox => "skybox",
-    };
     let mut tasks = FuturesUnordered::new();
+    let downloads_len = downloads.len();
+    let size = match target {
+        DownloadTarget::Textures(size) => size.to_string(),
+        DownloadTarget::Skybox(size) => size.to_string(),
+    };
+
     log(format!(
-        "Prepare downloading for {} {}",
-        downloads_len, kind
+        "Prepare downloading for {} {} in {}",
+        downloads_len,
+        target.kind(),
+        size,
     ));
 
     for download in downloads {
@@ -116,7 +123,7 @@ async fn download_data(
         tasks.push(async move { download_file(&client, url, download_dir, filename).await });
     }
 
-    let kind = format!("{kind}:");
+    let kind = format!("{kind}:", kind = target.kind());
     let mut count = 0;
     while tasks.next().await.is_some() {
         count = count + 1;
@@ -129,7 +136,7 @@ async fn download_data(
 async fn fetch_download_links(
     client: &Client,
     pages: Vec<String>,
-    button_text: &str,
+    button_text: String,
 ) -> (Vec<Download>, Vec<String>) {
     let mut downloads = Vec::with_capacity(pages.len());
     let mut misses = Vec::new();
@@ -137,6 +144,8 @@ async fn fetch_download_links(
 
     for page in pages {
         let client = client.clone();
+        let button_text = button_text.clone();
+
         tasks.push(async move { extract_download_data(&client, page, button_text).await });
     }
 
