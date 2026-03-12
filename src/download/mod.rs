@@ -5,37 +5,105 @@ use std::{
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use reqwest::Client;
 use scraper::{Html, Selector};
 use tokio::fs;
 
-use crate::app::DownloadArgs;
+use crate::app::{DownloadArgs, DownloadMode};
 
 const TEXTURE_URL: &str = "https://freestylized.com/all-textures/";
+const SKYBOX_URL: &str = "https://freestylized.com/all-skybox/";
+
+enum DownloadTarget {
+    Textures,
+    Skybox,
+}
 
 pub async fn run(args: DownloadArgs) -> Result<()> {
-    let client = Client::builder().build().context("Build HTTP client")?;
+    args.ensure_download_directory_exists().await;
 
-    let pages = fetch_texture_pages(&client).await?;
+    let client = Client::builder().build().context("Build HTTP client")?;
+    let button_text_textures = "1K";
+    let button_text_skybox = "2K";
+
+    let download_tex = async || {
+        download(
+            DownloadTarget::Textures,
+            button_text_textures,
+            &client,
+            args.download_textures_dir(),
+        )
+        .await
+    };
+
+    let download_sky = async || {
+        download(
+            DownloadTarget::Skybox,
+            button_text_skybox,
+            &client,
+            args.download_skybox_dir(),
+        )
+        .await
+    };
+
+    match args.mode() {
+        DownloadMode::All => {
+            let mut tasks: FuturesUnordered<BoxFuture<Result<()>>> = FuturesUnordered::new();
+
+            tasks.push(Box::pin(download_tex()));
+            tasks.push(Box::pin(download_sky()));
+
+            while tasks.next().await.is_some() {}
+        }
+        DownloadMode::Textures => download_tex().await?,
+        DownloadMode::Skybox => download_sky().await?,
+    }
+
+    Ok(())
+}
+
+async fn download(
+    target: DownloadTarget,
+    button_text: &str,
+    client: &Client,
+    download_dir: PathBuf,
+) -> Result<()> {
+    let url = match target {
+        DownloadTarget::Textures => TEXTURE_URL,
+        DownloadTarget::Skybox => SKYBOX_URL,
+    };
+    let pages = fetch_download_pages(&client, url).await?;
     log(format!("found {} pages", pages.len()));
 
-    let (downloads, misses) = fetch_download_links(&client, pages).await;
+    let (downloads, misses) = fetch_download_links(&client, pages, button_text).await;
     log(format!(
         "found {} downloads and {} invalid links",
         downloads.len(),
         misses.len()
     ));
 
-    args.ensure_download_directory_exists().await;
-    download_textures(&client, downloads, args.download_dir()).await;
+    download_data(&client, downloads, download_dir, target).await;
 
     Ok(())
 }
 
-async fn download_textures(client: &Client, downloads: Vec<Download>, download_dir: &PathBuf) {
+async fn download_data(
+    client: &Client,
+    downloads: Vec<Download>,
+    download_dir: PathBuf,
+    target: DownloadTarget,
+) {
+    let downloads_len = downloads.len();
+    let kind = match target {
+        DownloadTarget::Textures => "texture",
+        DownloadTarget::Skybox => "skybox",
+    };
     let mut tasks = FuturesUnordered::new();
-    log(format!("prepare download of {} tasks", tasks.len()));
+    log(format!(
+        "Prepare downloading for {} {}",
+        downloads_len, kind
+    ));
 
     for download in downloads {
         let client = client.clone();
@@ -43,26 +111,33 @@ async fn download_textures(client: &Client, downloads: Vec<Download>, download_d
         let url = match &download.info {
             DownloadInfo::Zip(url) | DownloadInfo::GDrive(url) => url.clone(),
         };
-        let page_title = download.page_title.clone();
+        let filename = download.filename.clone();
 
-        tasks.push(async move { download_file(&client, url, download_dir, page_title).await });
+        tasks.push(async move { download_file(&client, url, download_dir, filename).await });
     }
 
+    let kind = format!("{kind}:");
     let mut count = 0;
     while tasks.next().await.is_some() {
         count = count + 1;
-        log(format!("Finished download no. {count}"));
+
+        let msg = format!("Finished download {kind:<8} {} of {}", count, downloads_len,);
+        log(msg);
     }
 }
 
-async fn fetch_download_links(client: &Client, pages: Vec<String>) -> (Vec<Download>, Vec<String>) {
+async fn fetch_download_links(
+    client: &Client,
+    pages: Vec<String>,
+    button_text: &str,
+) -> (Vec<Download>, Vec<String>) {
     let mut downloads = Vec::with_capacity(pages.len());
     let mut misses = Vec::new();
     let mut tasks = FuturesUnordered::new();
 
     for page in pages {
         let client = client.clone();
-        tasks.push(async move { extract_download_data(&client, page, "1K").await });
+        tasks.push(async move { extract_download_data(&client, page, button_text).await });
     }
 
     while let Some(result) = tasks.next().await {
@@ -77,14 +152,12 @@ async fn fetch_download_links(client: &Client, pages: Vec<String>) -> (Vec<Downl
     (downloads, misses)
 }
 
-async fn download_file<S: AsRef<str>, P: AsRef<Path>>(
+async fn download_file<P: AsRef<Path>>(
     client: &Client,
     url: String,
     download_dir: P,
-    page_title: S,
+    filename: String,
 ) -> Result<()> {
-    let safe_name = page_title.as_ref().replace(' ', "_");
-    let filename = format!("{}.zip", safe_name);
     let mut path = download_dir.as_ref().to_path_buf();
     path.push(&filename);
 
@@ -110,21 +183,21 @@ async fn download_file<S: AsRef<str>, P: AsRef<Path>>(
 #[derive(Debug, Clone)]
 struct Download {
     info: DownloadInfo,
-    page_title: String,
+    filename: String,
 }
 
 impl Download {
-    fn zip(url: String, page_title: String) -> Self {
+    fn zip(url: String, filename: String) -> Self {
         Self {
             info: DownloadInfo::Zip(url),
-            page_title,
+            filename,
         }
     }
 
-    fn gdrive(url: String, page_title: String) -> Self {
+    fn gdrive(url: String, filename: String) -> Self {
         Self {
             info: DownloadInfo::GDrive(url),
-            page_title,
+            filename,
         }
     }
 }
@@ -149,12 +222,7 @@ async fn extract_download_data<P: AsRef<str>, B: AsRef<str>>(
 
     let document = Html::parse_document(&body);
     let selector = Selector::parse(".breakdance-link").unwrap();
-
-    let page_title = document
-        .select(&Selector::parse("title").unwrap())
-        .next()
-        .map(|t| t.text().collect::<String>())
-        .unwrap_or_else(|| "unknown_texture".into());
+    let filename = get_filename(&document);
 
     for element in document.select(&selector) {
         let text = element.text().collect::<String>();
@@ -167,11 +235,11 @@ async fn extract_download_data<P: AsRef<str>, B: AsRef<str>>(
                 return match () {
                     _ if link.ends_with(".zip") => Ok(ExtractLinkResult::Found(Download::zip(
                         link.into(),
-                        page_title,
+                        filename,
                     ))),
 
                     _ if link.contains("drive.google.com") => Ok(ExtractLinkResult::Found(
-                        Download::gdrive(link.into(), page_title),
+                        Download::gdrive(link.into(), filename),
                     )),
 
                     _ => Ok(ExtractLinkResult::Missed(page.as_ref().into())),
@@ -183,8 +251,24 @@ async fn extract_download_data<P: AsRef<str>, B: AsRef<str>>(
     Ok(ExtractLinkResult::Missed(page.as_ref().into()))
 }
 
-async fn fetch_texture_pages(client: &Client) -> Result<Vec<String>> {
-    let body = client.get(TEXTURE_URL).send().await?.text().await?;
+fn get_filename(document: &Html) -> String {
+    let page_title = document
+        .select(&Selector::parse("title").unwrap())
+        .next()
+        .map(|t| t.text().collect::<String>())
+        .unwrap_or_else(|| "unknown_texture".into());
+
+    let safe = |s: &str| format!("{}.zip", s.replace(' ', "_"));
+
+    if let Some(part) = page_title.split('|').next() {
+        return safe(part);
+    }
+
+    return safe(&page_title[0..20]);
+}
+
+async fn fetch_download_pages(client: &Client, url: &str) -> Result<Vec<String>> {
+    let body = client.get(url).send().await?.text().await?;
 
     let document = Html::parse_document(&body);
     let selector = Selector::parse(".ee-posts-grid .ee-post .ee-post-image-link").unwrap();
