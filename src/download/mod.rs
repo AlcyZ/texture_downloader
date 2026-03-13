@@ -126,31 +126,43 @@ async fn download_data(
     ));
 
     for download in downloads {
-        let permit = limit
-            .clone()
-            .acquire_owned()
-            .await
-            .context("Aquire download limit semaphore")?;
         let client = client.clone();
         let download_dir = download_dir.clone();
+        let limit = limit.clone(); // Klon für den Task
         let url = match &download.info {
             DownloadInfo::Zip(url) | DownloadInfo::GDrive(url) => url.clone(),
         };
         let filename = download.filename.clone();
 
         tasks.push(async move {
-            let _permit = permit;
+            let _permit = limit
+                .acquire_owned()
+                .await
+                .context("Acquire download limit semaphore")?;
+
             download_file(&client, url, download_dir, filename).await
         });
     }
 
-    let kind = format!("{kind}:", kind = target.kind());
-    let mut count = 0;
-    while tasks.next().await.is_some() {
-        count = count + 1;
-
-        let msg = format!("Finished download {kind:<8} {} of {}", count, downloads_len,);
-        log(msg);
+    let kind = format!("{}:", target.kind());
+    let mut success = 0;
+    let mut errors = 0;
+    while let Some(result) = tasks.next().await {
+        match result {
+            Ok(_) => {
+                success += 1;
+                let msg = format!(
+                    "Finished download {kind:<8} {} of {}",
+                    success, downloads_len
+                );
+                log(msg);
+            }
+            Err(_) => {
+                errors += 1;
+                let msg = format!("Failed to download {}. Errors: {}", kind, errors,);
+                log(msg);
+            }
+        }
     }
 
     Ok(())
