@@ -1,6 +1,7 @@
 use std::{
     collections::HashSet,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, Result};
@@ -8,7 +9,7 @@ use chrono::Utc;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use reqwest::Client;
 use scraper::{Html, Selector};
-use tokio::fs;
+use tokio::{fs, sync::Semaphore};
 
 use crate::app::{DownloadArgs, DownloadMode, SkyboxSize, TextureSize};
 
@@ -33,21 +34,24 @@ pub async fn run(args: DownloadArgs) -> Result<()> {
     args.ensure_download_directory_exists().await;
 
     let client = Client::builder().build().context("Build HTTP client")?;
+    let limit = Arc::new(Semaphore::new(args.limit()));
 
-    let download_tex = async |size| {
+    let download_tex = async |size, limit| {
         download(
             DownloadTarget::Textures(size),
             &client,
             args.download_textures_dir(),
+            limit,
         )
         .await
     };
 
-    let download_sky = async |size| {
+    let download_sky = async |size, limit| {
         download(
             DownloadTarget::Skybox(size),
             &client,
             args.download_skybox_dir(),
+            limit,
         )
         .await
     };
@@ -59,35 +63,43 @@ pub async fn run(args: DownloadArgs) -> Result<()> {
         } => {
             let mut tasks: FuturesUnordered<BoxFuture<Result<()>>> = FuturesUnordered::new();
 
-            tasks.push(Box::pin(download_tex(size_textures)));
-            tasks.push(Box::pin(download_sky(size_skybox)));
+            tasks.push(Box::pin(download_tex(size_textures, limit.clone())));
+            tasks.push(Box::pin(download_sky(size_skybox, limit)));
 
             while tasks.next().await.is_some() {}
         }
-        DownloadMode::Textures { size_textures } => download_tex(size_textures).await?,
-        DownloadMode::Skybox { size_skybox } => download_sky(size_skybox).await?,
+        DownloadMode::Textures { size_textures } => download_tex(size_textures, limit).await?,
+        DownloadMode::Skybox { size_skybox } => download_sky(size_skybox, limit).await?,
     }
 
     Ok(())
 }
 
-async fn download(target: DownloadTarget, client: &Client, download_dir: PathBuf) -> Result<()> {
+async fn download(
+    target: DownloadTarget,
+    client: &Client,
+    download_dir: PathBuf,
+    limit: Arc<Semaphore>,
+) -> Result<()> {
+    let kind = target.kind().to_string();
     let (url, button_text) = match target {
         DownloadTarget::Textures(size) => (TEXTURE_URL, size.to_string()),
         DownloadTarget::Skybox(size) => (SKYBOX_URL, size.to_string()),
     };
     let pages = fetch_download_pages(&client, url).await?;
-    log(format!("Found {} {} pages", pages.len(), target.kind()));
+    log(format!("Found {} {} pages", pages.len(), kind));
 
     let (downloads, misses) = fetch_download_links(&client, pages, button_text).await;
     log(format!(
         "Found {} {} downloads and {} invalid links",
         downloads.len(),
-        target.kind(),
+        kind,
         misses.len()
     ));
 
-    download_data(&client, downloads, download_dir, target).await;
+    download_data(&client, downloads, download_dir, target, limit)
+        .await
+        .context(format!("download {} data", kind))?;
 
     Ok(())
 }
@@ -97,7 +109,8 @@ async fn download_data(
     downloads: Vec<Download>,
     download_dir: PathBuf,
     target: DownloadTarget,
-) {
+    limit: Arc<Semaphore>,
+) -> Result<()> {
     let mut tasks = FuturesUnordered::new();
     let downloads_len = downloads.len();
     let size = match target {
@@ -113,6 +126,11 @@ async fn download_data(
     ));
 
     for download in downloads {
+        let permit = limit
+            .clone()
+            .acquire_owned()
+            .await
+            .context("Aquire download limit semaphore")?;
         let client = client.clone();
         let download_dir = download_dir.clone();
         let url = match &download.info {
@@ -120,7 +138,10 @@ async fn download_data(
         };
         let filename = download.filename.clone();
 
-        tasks.push(async move { download_file(&client, url, download_dir, filename).await });
+        tasks.push(async move {
+            let _permit = permit;
+            download_file(&client, url, download_dir, filename).await
+        });
     }
 
     let kind = format!("{kind}:", kind = target.kind());
@@ -131,6 +152,8 @@ async fn download_data(
         let msg = format!("Finished download {kind:<8} {} of {}", count, downloads_len,);
         log(msg);
     }
+
+    Ok(())
 }
 
 async fn fetch_download_links(

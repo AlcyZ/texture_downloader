@@ -7,6 +7,7 @@ use tokio::fs::create_dir_all;
 use crate::download;
 
 const DEFAULT_DOWNLOAD_DIR: &str = "./textures";
+const DEFAULT_DOWNLOAD_LIMIT: usize = 64;
 const DEFAULT_SIZE_TEXTURE: TextureSize = TextureSize::_4K;
 const DEFAULT_SIZE_SKYBOX: SkyboxSize = SkyboxSize::_2K;
 
@@ -32,6 +33,10 @@ struct Cli {
 
     #[command(subcommand)]
     mode: DownloadMode,
+
+    /// (Optional) Limits the amount of consecutive downloads by this value.
+    #[arg(short, long, default_value_t = DEFAULT_DOWNLOAD_LIMIT)]
+    limit: usize,
 }
 
 #[derive(Subcommand, Debug, Clone, Copy, PartialEq)]
@@ -88,6 +93,7 @@ impl ToString for SkyboxSize {
 pub struct DownloadArgs {
     dir: PathBuf,
     mode: DownloadMode,
+    limit: usize,
 }
 
 impl DownloadArgs {
@@ -119,6 +125,10 @@ impl DownloadArgs {
         dir
     }
 
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
     async fn create_all_dir(&self) {
         let _ = tokio::join!(self.create_textures_dir(), self.create_skybox_dir());
     }
@@ -143,6 +153,7 @@ impl From<Cli> for DownloadArgs {
         Self {
             dir: value.dir,
             mode: value.mode,
+            limit: value.limit,
         }
     }
 }
